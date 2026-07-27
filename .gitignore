@@ -1,0 +1,3 @@
+build/
+*.ts
+.DS_Store
