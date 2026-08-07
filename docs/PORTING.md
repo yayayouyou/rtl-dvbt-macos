@@ -149,20 +149,21 @@ matter if 7 and 8 MHz ever need to work.
 The demodulator locks and the endpoint delivers data at a plausible TS rate,
 but the bytes are uniformly distributed with no 188-byte structure.
 
-**The likely answer is signal quality, not configuration.** `readBer()`
-returns **65535 on every channel — the register's maximum, i.e. saturated**.
-The Reed-Solomon stage is seeing error rates it cannot correct at all. FSM
-stage 11 means carrier and timing acquisition succeeded; it does not mean the
-data survived. A demodulator in exactly this state emits TS-rate output whose
-every packet is uncorrectable, which is indistinguishable from noise — sync
-bytes included.
+At this point the conclusion drawn was **"signal quality, not configuration"**
+— `readBer()` was returning 65535 on every channel, the local signal measured
+only 7–9 dB above noise on a stock whip indoors, and 64-QAM DVB-T wants around
+20 dB. The recommendation was to get a better antenna.
 
-The measured margin supports that reading: the local signal is 7–9 dB above
-noise floor. DVB-T with 64-QAM wants roughly 20 dB. This is a stock whip
-antenna indoors.
+**That conclusion was wrong**, and the correction is worth recording. The user
+pointed out they had already received this exact channel with this exact
+dongle and antenna, in this location, using the Linux kernel driver in a VM.
+That single fact killed the hypothesis outright: the signal was fine, so the
+7–9 dB figure was measuring something other than what mattered, and the
+saturated BER had to be our own doing.
 
-**Next step is a better antenna, not more code.** If BER drops off its rail
-and sync bytes appear, the driver was right all along.
+It was: the gain was wrong (see above). The lesson is that a plausible
+physical explanation is not evidence, and one report of the same hardware
+working elsewhere outweighs a lot of internally consistent reasoning.
 
 Ruled out along the way, so nobody redoes them:
 
