@@ -15,6 +15,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
+#include <unistd.h>
 #include <string.h>
 
 #include "rtl2832_dvbt.h"
@@ -337,10 +339,19 @@ int rtl2832_dvbt_init(rtlsdr_dev_t *dev)
 	 * sweep this by hand while acquisition is still stalling.
 	 */
 	{
-		const char *env = getenv("RTL_DVBT_GAINMODE");
-		int mode = env ? (int)strtol(env, NULL, 0) : 0;
+		const char *g = getenv("RTL_DVBT_GAIN");
 
-		rtlsdr_set_tuner_gain_mode(dev, mode);
+		if (g) {
+			/* Manual tuner gain in tenths of a dB. With a CNR
+			 * meter available (rtl2832_dvbt_read_signal) this is
+			 * worth sweeping: the demodulator's own AGC optimises
+			 * for level, not for carrier-to-noise, and on a
+			 * marginal signal the two disagree. */
+			rtlsdr_set_tuner_gain_mode(dev, 1);
+			rtlsdr_set_tuner_gain(dev, (int)strtol(g, NULL, 0));
+		} else {
+			rtlsdr_set_tuner_gain_mode(dev, 0);
+		}
 	}
 
 	r = reg_write_table(dev, rtl2832_initial_regs,
@@ -366,6 +377,68 @@ int rtl2832_dvbt_init(rtlsdr_dev_t *dev)
 	}
 
 	return 0;
+}
+
+/*
+ * Pick the tuner gain that actually decodes, by measuring.
+ *
+ * librtlsdr's automatic gain mode is tuned for SDR: it maximises signal level
+ * into the ADC, which for a strong nearby transmitter drives the R820T front
+ * end into compression. The demodulator then locks perfectly well - carrier,
+ * timing, even the TPS field all come out right - while the constellation is
+ * smeared badly enough that Reed-Solomon cannot correct anything. The result
+ * is a confident-looking lock delivering unusable bytes, which is a genuinely
+ * confusing failure to debug.
+ *
+ * Measured on TTV, 581 MHz, seconds apart on the same channel:
+ *   automatic gain -> CNR 16.1 dB, BER 65535/1e6, no sync bytes at all
+ *   14.7 dB fixed  -> EVM 0,       BER    39/1e6, 100%% TS sync
+ *
+ * So sweep, and keep the gain with the lowest post-Viterbi BER. Costs about
+ * two seconds on tune, and stops as soon as the error rate is low enough for
+ * Reed-Solomon to mop up the rest.
+ */
+static int auto_gain(rtlsdr_dev_t *dev)
+{
+	int gains[64];
+	int n, i, best_gain = 0, best_ber = -1;
+	rtl2832_signal_t sig;
+
+	n = rtlsdr_get_tuner_gains(dev, gains);
+	if (n <= 0 || n > (int)(sizeof(gains) / sizeof(gains[0])))
+		return rtlsdr_set_tuner_gain_mode(dev, 0);
+
+	rtlsdr_set_tuner_gain_mode(dev, 1);
+
+	for (i = 0; i < n; i++) {
+		if (rtlsdr_set_tuner_gain(dev, gains[i]) < 0)
+			continue;
+
+		usleep(250000);
+
+		if (rtl2832_dvbt_read_signal(dev, &sig) < 0)
+			continue;
+		if (sig.fsm_stage != 11)
+			continue;
+
+		if (best_ber < 0 || sig.ber < best_ber) {
+			best_ber = sig.ber;
+			best_gain = gains[i];
+		}
+
+		if (sig.ber < 100)
+			break;
+	}
+
+	if (best_ber < 0) {
+		/* Never locked at any gain - hand it back to the hardware. */
+		return rtlsdr_set_tuner_gain_mode(dev, 0);
+	}
+
+	fprintf(stderr, "Gain %.1f dB (BER %d/1e6)\n",
+		best_gain / 10.0, best_ber);
+
+	return rtlsdr_set_tuner_gain(dev, best_gain);
 }
 
 int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
@@ -539,6 +612,70 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 1)) < 0) return r;
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 0)) < 0) return r;
+
+	/* Everything is configured; now find the gain that actually decodes.
+	 * Skipped when RTL_DVBT_GAIN pins it by hand. */
+	{
+		const char *g = getenv("RTL_DVBT_GAIN");
+
+		if (!(g && *g))
+			auto_gain(dev);
+	}
+
+	return 0;
+}
+
+/*
+ * Full acquisition status, read the way the Linux kernel driver reads it
+ * (rtl2832_read_status()). These are the numbers that distinguish "the
+ * signal is poor" from "we decoded it wrong":
+ *
+ *   constellation / hierarchy come from the TPS field. If they are garbage,
+ *   the demodulator misread the transmission parameters and everything
+ *   downstream is doomed regardless of signal strength. The kernel treats
+ *   out-of-range values as a hard error.
+ *
+ *   CNR is computed from the channel estimator's error-vector magnitude with
+ *   the kernel's per-constellation constants, in units of 0.001 dB.
+ */
+int rtl2832_dvbt_read_signal(rtlsdr_dev_t *dev, rtl2832_signal_t *out)
+{
+	static const uint32_t cnr_const[3][4] = {
+		{85387325, 85387325, 85387325, 85387325},
+		{86676178, 86676178, 87167949, 87795660},
+		{87659938, 87659938, 87885178, 88241743},
+	};
+	uint32_t stage;
+	uint16_t tps, evm;
+
+	if (!dev || !out)
+		return -1;
+
+	memset(out, 0, sizeof(*out));
+
+	if (reg_read(dev, DVBT_FSM_STAGE, &stage) < 0)
+		return -1;
+	out->fsm_stage = (int)stage;
+
+	/* digital AGC, page3 0x05 - how hard the demod is pulling gain */
+	out->digital_agc = demod_rd(dev, 3, 0x05, 1) & 0xff;
+
+	tps = demod_rd(dev, 3, 0x3c, 1) & 0xff;
+	out->constellation = (tps >> 2) & 0x03;
+	out->hierarchy     = (tps >> 4) & 0x07;
+	out->tps_valid     = (out->constellation < 3 && out->hierarchy < 4);
+
+	evm = demod_rd(dev, 4, 0x0c, 2);
+	out->evm = evm;
+
+	if (out->tps_valid && evm) {
+		double l = log10((double)evm) * 16777216.0;
+		out->cnr_millidb = (int)((cnr_const[out->constellation]
+					  [out->hierarchy] - l)
+					 / ((1 << 24) / 10000.0));
+	}
+
+	out->ber = demod_rd(dev, 3, 0x4e, 2);
 
 	return 0;
 }

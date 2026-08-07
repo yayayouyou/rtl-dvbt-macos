@@ -175,8 +175,22 @@ int main(int argc, char **argv)
 	}
 
 	if (status)
-		fprintf(stderr, "\nLOCKED - BER %d errors/MB, EVM %d\n",
-			rtl2832_dvbt_read_ber(dev), rtl2832_dvbt_read_snr(dev));
+	{
+		rtl2832_signal_t sig;
+
+		if (rtl2832_dvbt_read_signal(dev, &sig) == 0)
+			fprintf(stderr,
+				"\n  stage=%d  agc=0x%02x  constellation=%s  "
+				"hierarchy=%d  TPS=%s\n  CNR=%.2f dB  EVM=%d  "
+				"BER=%d/1e6\n",
+				sig.fsm_stage, sig.digital_agc,
+				sig.constellation == 0 ? "QPSK" :
+				sig.constellation == 1 ? "16QAM" :
+				sig.constellation == 2 ? "64QAM" : "INVALID",
+				sig.hierarchy,
+				sig.tps_valid ? "valid" : "GARBAGE",
+				sig.cnr_millidb / 1000.0, sig.evm, sig.ber);
+	}
 	else
 		fprintf(stderr,
 			"\nNever reached lock in 10s (last stage %d). "

@@ -58,7 +58,7 @@ target_include_directories(rtl_dvbt PRIVATE
 )
 
 target_link_directories(rtl_dvbt PRIVATE ${LIBUSB_LIBRARY_DIRS})
-target_link_libraries(rtl_dvbt PRIVATE ${LIBUSB_LIBRARIES})
+target_link_libraries(rtl_dvbt PRIVATE ${LIBUSB_LIBRARIES} m)
 
 # librtlsdr's own build defines this; its sources expect it.
 target_compile_definitions(rtl_dvbt PRIVATE _GNU_SOURCE)

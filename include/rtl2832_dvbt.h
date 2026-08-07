@@ -72,6 +72,20 @@ int rtl2832_dvbt_get_status(rtlsdr_dev_t *dev);
 void rtl2832_dvbt_dump_regs(rtlsdr_dev_t *dev, const char *when);
 int rtl2832_dvbt_get_fsm_stage(rtlsdr_dev_t *dev);
 
+/* Everything the kernel driver reports, in one read. */
+typedef struct {
+	int fsm_stage;      /* 11 = lock, 10 = viterbi but no sync */
+	int digital_agc;    /* page3 0x05 */
+	int constellation;  /* 0=QPSK 1=16QAM 2=64QAM; >2 means TPS is garbage */
+	int hierarchy;      /* 0..3; >3 means TPS is garbage */
+	int tps_valid;      /* both of the above in range */
+	int evm;            /* channel-estimator error vector magnitude */
+	int cnr_millidb;    /* carrier-to-noise, 0.001 dB units */
+	int ber;            /* bit errors per 1e6 bits */
+} rtl2832_signal_t;
+
+int rtl2832_dvbt_read_signal(rtlsdr_dev_t *dev, rtl2832_signal_t *out);
+
 /*
  * Channel-estimator error-vector magnitude. Lower is better. Not yet
  * converted to dB - see the comment in the implementation. Returns negative

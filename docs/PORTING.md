@@ -92,7 +92,59 @@ Unlike the Java's bare `R820tTuner`, librtlsdr's tuner wrappers touch demod
 registers as a side effect. The DVB-T datapath therefore has to be
 re-asserted *after* the tuner calls, not just once during init.
 
-## Still open — but probably not a code problem
+## SOLVED: the blocker was tuner gain
+
+**Root cause: librtlsdr's automatic gain mode.** It is optimised for SDR - it
+maximises signal level into the ADC. On a strong transmitter that drives the
+R820T front end into compression. The demodulator then locks completely
+convincingly: FSM stage 11, TPS decodes to 64QAM/hierarchy 0, output arrives
+at the correct transport-stream rate. And every packet is uncorrectable.
+
+Same channel (TTV, 581 MHz), seconds apart:
+
+| gain | CNR | EVM | BER | result |
+|---|---|---|---|---|
+| librtlsdr automatic | 16.1 dB | 4084 | 65535/1e6 | uniform noise, 2% sync |
+| 14.7 dB fixed | - | 0 | 39/1e6 | 100% sync, valid TS |
+| 22.9 dB (swept) | 24.4 dB | 606 | **0/1e6** | 100% sync, H.264 1920x1080 |
+
+Fixed by `auto_gain()` in rtl2832_dvbt.c: sweep the tuner's gain table, keep
+the value with the lowest post-Viterbi BER, stop early once it is under 100.
+
+**The lesson that would have saved hours:** "the demodulator reports lock" and
+"the demodulator is producing usable data" are different claims, and the gap
+between them is almost always gain. Read BER before believing a lock. We spent
+a long time hunting a routing bug that did not exist because stage 11 looked
+so much like success.
+
+The corollary is about diagnostics. Three of the four things that actually
+moved this forward were measurements, not fixes: reading the real FSM stage
+register, porting `readBer()`, and porting the kernel's full `read_status()`
+(constellation, hierarchy, CNR). Each one turned an opaque failure into an
+obvious one. Port the instruments before the features.
+
+### Two tuner values also corrected
+
+While comparing against the kernel's `r820t_set_tv_standard()`, librtlsdr's
+`r82xx_set_tv_standard()` turned out to differ on two DVB-T parameters:
+
+| | kernel | librtlsdr |
+|---|---|---|
+| `filt_gain` | 0x10 | 0x30 |
+| `loop_through` | 0x00 (lt on) | 0x80 (lt off) |
+
+Changed back to the kernel's values in the vendored copy. Neither was the
+blocker on its own - BER stayed at 65535 after the change - but they are the
+kernel's tested settings for this delivery system.
+
+Also worth knowing: librtlsdr calls `r82xx_set_tv_standard()` exactly once,
+from `r82xx_init()`, with a hardcoded `bw=3`. The kernel calls it on **every**
+tune with the real bandwidth. That has not mattered for 6 MHz, but it will
+matter if 7 and 8 MHz ever need to work.
+
+## Historical: what was ruled out before the gain finding
+
+
 
 The demodulator locks and the endpoint delivers data at a plausible TS rate,
 but the bytes are uniformly distributed with no 188-byte structure.
