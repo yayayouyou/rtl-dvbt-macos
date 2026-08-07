@@ -1,8 +1,115 @@
 # Porting notes
 
-Findings from reading the two upstreams side by side, and the things most
-likely to cost you a weekend. Written before any hardware test, so the
-"suspects" list below is reasoning, not experience.
+Findings from reading the two upstreams side by side, plus what the first
+hardware session actually taught us.
+
+## First hardware session — what happened
+
+Dongle: `0bda:2838` RTL2838UHIDIR, R820T tuner, indoor antenna, Taiwan.
+
+Spectrum scan found real DVB-T at 533, 545, 557, 569 and 581 MHz — every
+other 6 MHz channel, flat across the channel, 7–9 dB above noise. Weak but
+present.
+
+**Result: the demodulator now locks (FSM stage 11) and the endpoint delivers
+~1.4 MB/s. It did not before — it delivered nothing at all.** The bytes are
+not yet valid transport-stream packets, so this is not finished, but the
+demodulator genuinely acquires Taiwan's DVB-T signal from macOS.
+
+Four defects were found and fixed. In order of how much they mattered:
+
+### 1. Tuner call order — the one that actually mattered
+
+`rtl2832_dvbt_set_params()` called `rtlsdr_set_tuner_bandwidth()` before
+`rtlsdr_set_center_freq()`. That is fatal, for a reason that is invisible
+unless you read librtlsdr's tuner shims:
+
+```c
+/* librtlsdr.c:253, r820t_set_bw() */
+return rtlsdr_set_center_freq(devt, devt->freq);
+```
+
+Upstream osmocom guards this with `if (devt->freq > 0)`. This fork does not.
+Straight out of `rtlsdr_open()`, `dev->freq` is still 0 — the struct is
+memset and the only assignments to it live inside `rtlsdr_set_center_freq`
+itself. So the bandwidth call re-tunes to **0 Hz**, which trips librtlsdr's
+automatic direct-sampling switch (`freq < 24 MHz` on an R820T), and
+`_rtlsdr_set_direct_sampling()` calls `r82xx_standby()` on the way in.
+
+The tuner goes to sleep, and the excursion rewrites demod registers back to
+their SDR values — dismantling the DVB-T configuration set up moments
+earlier. Every register write still returns success.
+
+Tune first, then set bandwidth. As a bonus this also leaves the I2C repeater
+closed: `set_center_freq` opens it and never closes it (librtlsdr.c:913 is
+commented out) whereas `set_tuner_bandwidth` does.
+
+**The misleading part:** this prints `Enabled direct sampling mode, input 2`
+and `[R82XX] PLL not locked!`. Stock `rtl_sdr` prints those too, at the same
+frequency, and works fine — so they read as harmless startup noise. They are
+harmless *in SDR mode*. Here they are the sound of your configuration being
+undone.
+
+### 2. AGC loops left disabled
+
+librtlsdr's `rtlsdr_init_baseband()` does:
+
+```c
+rtlsdr_demod_write_reg(dev, 1, 0x04, 0x00, 1);  /* disable RF and IF AGC loop */
+```
+
+Page 1 register 0x04 packs `EN_IF_AGC` (bit 7), `EN_RF_AGC` (bit 6),
+`AAGC_HOLD` (bit 5) and `LOOP_GAIN2_3_0` (bits 4:1). The register tables do
+write `LOOP_GAIN2_3_0`, but as a read-modify-write on the low bits — the two
+enable bits stay zero.
+
+The Java driver has no equivalent code because it meets a freshly powered
+chip where these default to on. **Any state librtlsdr turns off for SDR that
+the Java assumes is at power-on default is a bug waiting in this port.** That
+class of defect is worth sweeping for deliberately.
+
+### 3. The status register was invented
+
+`rtl2832_dvbt_get_status()` originally read page 1 register 0x3c and tested
+bit 3. Page 1 0x3c has no named field at all — the address was made up.
+
+The real thing is `DVBT_FSM_STAGE` at **page 3, 0x51, bits 6:3**, and it is a
+*stage number*, not a bitmask: 11 is full lock, 10 is signal/carrier/Viterbi
+without sync, lower means still hunting.
+
+This mattered more than a cosmetic bug: with the wrong register everything
+reported "status 0x00, nothing", so there was no way to tell a demodulator
+that was almost locking from one that was not running at all. The moment it
+read the real register, the failure went from opaque to obvious — the chip
+was reaching stage 9 the whole time.
+
+**Read the diagnostic registers correctly before trusting any conclusion
+drawn from them.**
+
+### 4. librtlsdr's tuner helpers write demod registers
+
+Unlike the Java's bare `R820tTuner`, librtlsdr's tuner wrappers touch demod
+registers as a side effect. The DVB-T datapath therefore has to be
+re-asserted *after* the tuner calls, not just once during init.
+
+## Still open
+
+The demodulator locks but the endpoint yields uniformly distributed bytes,
+not 188-byte TS packets (best alignment gives ~2% sync bytes, consistent with
+chance). Verified not to be:
+
+- register configuration — a full readback before capture shows every DVB-T
+  field at its intended value (`RTL_DVBT_DUMP=1`)
+- capture timing — capturing the instant stage 11 is observed changes nothing
+- `DVBT_SERIAL` 0 vs 1, IF frequency 0–5 MHz, `SPEC_INV` 0/1, tuner gain
+  mode auto/manual — all swept, none produce sync
+- USB endpoint choice — the Java uses interface 0, endpoint 0x81, same as us
+
+So something still routes the ADC path rather than the demodulator's TS
+output to the USB FIFO, or the TS needs an enable this port has not found.
+That is the next thing to chase.
+
+---
 
 ## The gap being filled
 

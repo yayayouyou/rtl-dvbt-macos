@@ -64,8 +64,18 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 int rtl2832_dvbt_get_status(rtlsdr_dev_t *dev);
 
 /*
- * Signal-to-noise ratio in units of 0.1 dB. Only meaningful once the
- * demodulator has locked. Returns negative on failure.
+ * Raw acquisition state-machine stage, 0-15. This is the single most useful
+ * diagnostic when nothing locks: it says how far the demodulator got.
+ * 11 = full lock, 10 = signal/carrier/Viterbi but no sync, lower = still
+ * hunting. Returns negative on failure.
+ */
+void rtl2832_dvbt_dump_regs(rtlsdr_dev_t *dev, const char *when);
+int rtl2832_dvbt_get_fsm_stage(rtlsdr_dev_t *dev);
+
+/*
+ * Channel-estimator error-vector magnitude. Lower is better. Not yet
+ * converted to dB - see the comment in the implementation. Returns negative
+ * on failure.
  */
 int rtl2832_dvbt_read_snr(rtlsdr_dev_t *dev);
 

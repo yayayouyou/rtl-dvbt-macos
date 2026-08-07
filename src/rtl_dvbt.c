@@ -150,20 +150,37 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 
-	/* Give the demodulator a moment to acquire before asking. */
-	usleep(500000);
+	/*
+	 * Wait for lock, then start capturing immediately.
+	 *
+	 * This matters more than it looks. On a marginal signal the
+	 * demodulator locks and drops repeatedly, so any time spent between
+	 * observing lock and opening the endpoint is time the lock can be lost
+	 * in - and what lands in the file is then whatever the chip emits
+	 * while unlocked, which is indistinguishable from noise.
+	 */
+	fprintf(stderr, "Waiting for lock (FSM stage, 11 = lock): ");
+	status = 0;
+	for (int i = 0; i < 100; i++) {
+		int st = rtl2832_dvbt_get_fsm_stage(dev);
 
-	status = rtl2832_dvbt_get_status(dev);
-	if (status > 0 && (status & RTL2832_HAS_LOCK)) {
-		fprintf(stderr, "Locked. SNR %.1f dB\n",
-			rtl2832_dvbt_read_snr(dev) / 10.0);
-	} else {
-		fprintf(stderr,
-			"No lock (status 0x%02x). Capturing anyway - the "
-			"stream will be garbage, but the capture tells you "
-			"whether bytes are flowing at all.\n",
-			status < 0 ? 0 : status);
+		if (i % 5 == 0)
+			fprintf(stderr, "%d ", st);
+
+		if (st == 11) {
+			status = 1;
+			break;
+		}
+		usleep(100000);
 	}
+
+	if (status)
+		fprintf(stderr, "\nLOCKED - capturing now.\n");
+	else
+		fprintf(stderr,
+			"\nNever reached lock in 10s (last stage %d). "
+			"Capturing anyway.\n",
+			rtl2832_dvbt_get_fsm_stage(dev));
 
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
@@ -176,6 +193,9 @@ int main(int argc, char **argv)
 		sigaction(SIGALRM, &sa, NULL);
 		alarm((unsigned)seconds);
 	}
+
+	if (getenv("RTL_DVBT_DUMP"))
+		rtl2832_dvbt_dump_regs(dev, "just before capture");
 
 	rtlsdr_reset_buffer(dev);
 

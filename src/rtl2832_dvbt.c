@@ -14,6 +14,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "rtl2832_dvbt.h"
@@ -124,6 +125,27 @@ static int reg_write(rtlsdr_dev_t *dev, rtl2832_reg_id id, uint32_t val)
 	return demod_wr_bytes(dev, reg->page, reg->addr, buf, len);
 }
 
+/* Read a named bit-field. Mirrors rdDemodReg() in the Java. */
+static int reg_read(rtlsdr_dev_t *dev, rtl2832_reg_id id, uint32_t *out)
+{
+	const rtl2832_reg_t *reg = &rtl2832_regs[id];
+	uint8_t len = (uint8_t)((reg->msb >> 3) + 1);
+	uint32_t mask = (1u << (reg->msb - reg->lsb + 1)) - 1;
+	uint32_t cur = 0;
+
+	if (len > 4)
+		return -1;
+
+	for (uint8_t i = 0; i < len; i++) {
+		uint16_t b = demod_rd(dev, reg->page,
+				      (uint16_t)(reg->addr + i), 1);
+		cur |= (uint32_t)(b & 0xff) << ((len - 1 - i) * 8);
+	}
+
+	*out = (cur >> reg->lsb) & mask;
+	return 0;
+}
+
 static int reg_write_table(rtlsdr_dev_t *dev, const rtl2832_regval_t *tbl,
 			   size_t n)
 {
@@ -177,6 +199,40 @@ static int unset_sdr_mode(rtlsdr_dev_t *dev)
 }
 
 /*
+ * Undo the SDR-specific things librtlsdr switched OFF that DVB-T needs ON.
+ *
+ * This has no counterpart in the Java driver, and that is exactly why it was
+ * missing. AndroidDvbDriver talks to a freshly powered chip where these bits
+ * sit at their power-on defaults, so it never has to think about them. We
+ * arrive after librtlsdr's rtlsdr_init_baseband(), which deliberately clears
+ * them because SDR mode wants the raw ADC path with no automatic gain
+ * control:
+ *
+ *   rtlsdr_demod_write_reg(dev, 1, 0x04, 0x00, 1);
+ *       "disable RF and IF AGC loop"
+ *
+ * Page 1 register 0x04 packs EN_IF_AGC (bit 7), EN_RF_AGC (bit 6),
+ * AAGC_HOLD (bit 5) and LOOP_GAIN2_3_0 (bits 4:1) together. Our register
+ * tables do write LOOP_GAIN2_3_0, but as a read-modify-write on the low bits
+ * only — the two enable bits stay zero. The demodulator then has no way to
+ * drive the tuner's gain, the signal level into the ADC is never brought into
+ * range, and it can never lock. Every register write succeeds and nothing
+ * works.
+ *
+ * Call before the init tables so their LOOP_GAIN2 writes layer on top.
+ */
+static int restore_dvbt_defaults(rtlsdr_dev_t *dev)
+{
+	int r;
+
+	if ((r = reg_write(dev, DVBT_EN_IF_AGC, 1)) < 0) return r;
+	if ((r = reg_write(dev, DVBT_EN_RF_AGC, 1)) < 0) return r;
+	if ((r = reg_write(dev, DVBT_AAGC_HOLD, 0)) < 0) return r;
+
+	return 0;
+}
+
+/*
  * Tell the demodulator where the tuner is putting the IF.
  *
  * PSET_IFFREQ = -floor((if_hz % XTAL) * 2^22 / XTAL)
@@ -219,6 +275,23 @@ int rtl2832_dvbt_init(rtlsdr_dev_t *dev)
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 0)) < 0)
 		return r;
 
+	if ((r = restore_dvbt_defaults(dev)) < 0) {
+		fprintf(stderr, "rtl2832: could not re-enable AGC loops\n");
+		return r;
+	}
+
+	/*
+	 * In DVB-T the demodulator's AGC loop is what drives the tuner's gain;
+	 * a tuner pinned to a manual gain fights it. RTL_DVBT_GAINMODE lets us
+	 * sweep this by hand while acquisition is still stalling.
+	 */
+	{
+		const char *env = getenv("RTL_DVBT_GAINMODE");
+		int mode = env ? (int)strtol(env, NULL, 0) : 0;
+
+		rtlsdr_set_tuner_gain_mode(dev, mode);
+	}
+
 	r = reg_write_table(dev, rtl2832_initial_regs,
 			    RTL2832_INITIAL_REGS_LEN);
 	if (r < 0)
@@ -258,18 +331,88 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 		return -1;
 	}
 
-	/* Drive the tuner through librtlsdr's public API. r82xx_set_bandwidth()
+	/*
+	 * Drive the tuner through librtlsdr's public API. r82xx_set_bandwidth()
 	 * already carries the DVB-T IF values inherited from the kernel driver
 	 * (3.57 MHz at 6 MHz bandwidth), so we do not need to reach into the
-	 * tuner privately. */
-	if ((r = rtlsdr_set_tuner_bandwidth(dev, bw_hz)) < 0) {
-		fprintf(stderr, "rtl2832: set_tuner_bandwidth failed\n");
-		return r;
-	}
+	 * tuner privately.
+	 *
+	 * ORDER IS LOad-BEARING. rtlsdr_set_center_freq() must come FIRST.
+	 *
+	 * r820t_set_bw() ends with
+	 *     return rtlsdr_set_center_freq(devt, devt->freq);
+	 * (librtlsdr.c:253) and this fork has no `if (devt->freq > 0)` guard.
+	 * Straight out of rtlsdr_open(), dev->freq is still 0 - the struct is
+	 * memset and the only two assignments to it live inside
+	 * rtlsdr_set_center_freq itself. So calling set_tuner_bandwidth first
+	 * re-tunes to 0 Hz, which trips librtlsdr's automatic direct-sampling
+	 * switch (freq < 24 MHz on an R820T), and _rtlsdr_set_direct_sampling()
+	 * calls r82xx_standby() on the way in. The tuner goes to sleep and the
+	 * excursion rewrites demod registers back to their SDR values,
+	 * dismantling the DVB-T configuration we set up moments earlier.
+	 *
+	 * Tuning first leaves dev->freq set, the auto-switch evaluates false,
+	 * and the excursion never happens. It also means the I2C repeater is
+	 * closed on the way out: set_center_freq opens it and never closes it
+	 * (librtlsdr.c:913 is commented out), whereas set_tuner_bandwidth does.
+	 */
 	if ((r = rtlsdr_set_center_freq(dev, freq_hz)) < 0) {
 		fprintf(stderr, "rtl2832: set_center_freq failed\n");
 		return r;
 	}
+	if ((r = rtlsdr_set_tuner_bandwidth(dev, bw_hz)) < 0) {
+		fprintf(stderr, "rtl2832: set_tuner_bandwidth failed\n");
+		return r;
+	}
+
+	/*
+	 * librtlsdr's tuner helpers write demod registers as a side effect and
+	 * leave the I2C repeater open. Re-assert the DVB-T datapath before
+	 * configuring the rest of the demodulator.
+	 *
+	 * The Java reference does not need this: its tuner is a bare R820tTuner
+	 * that never touches demod registers, so "configure tuner, then
+	 * configure demod" holds trivially. Ours does not get that for free.
+	 */
+	if ((r = reg_write(dev, DVBT_IIC_REPEAT, 0)) < 0) return r;
+
+	/* page0 0x08: librtlsdr leaves 0x4d (I-phase ADC only); DVB-T needs both. */
+	if ((r = reg_write(dev, DVBT_AD_EN_REG, 1)) < 0) return r;
+	if ((r = reg_write(dev, DVBT_AD_EN_REG1, 1)) < 0) return r;
+
+	/* MPEG output routing, cleared by librtlsdr's page0 0x06 = 0x80. */
+	if ((r = reg_write(dev, DVBT_MPEG_IO_OPT_2_2, 0)) < 0) return r;
+	if ((r = reg_write(dev, DVBT_MPEG_IO_OPT_1_0, 0)) < 0) return r;
+
+	/* page1 0x15: unsetSdrMode's value, plus SPEC_INV for the R820T. */
+	if ((r = rtlsdr_demod_write_reg(dev, 1, 0x15, 0x06, 1)) < 0) return r;
+	if ((r = reg_write(dev, DVBT_SPEC_INV, 1)) < 0) return r;
+
+	/*
+	 * And the mode bit itself. page0 0x19 is what actually selects which
+	 * source feeds the USB FIFO: 0x05 is librtlsdr's "enable SDR mode"
+	 * (raw ADC samples), 0x20 is DVB-T (the demodulator's transport
+	 * stream). Without re-asserting it here the demodulator can lock
+	 * perfectly and you still read uniformly random bytes off the
+	 * endpoint, because you are reading the ADC, not the TS.
+	 */
+	if ((r = rtlsdr_demod_write_reg(dev, 0, 0x19, 0x20, 1)) < 0) return r;
+
+	/* RTL_DVBT_SERIAL: TS output format select (serial vs parallel). The
+	 * tables set 0; worth being able to flip while the demodulator locks
+	 * but the endpoint still yields non-TS bytes. */
+	{
+		const char *env = getenv("RTL_DVBT_SERIAL");
+
+		if (env) {
+			r = reg_write(dev, DVBT_SERIAL,
+				      (uint32_t)strtoul(env, NULL, 0));
+			if (r < 0) return r;
+		}
+	}
+
+	/* PID filter disabled (bits 7:6 = 11) - pass the whole stream. */
+	if ((r = rtlsdr_demod_write_reg(dev, 0, 0x61, 0xe0, 1)) < 0) return r;
 
 	/*
 	 * TODO(phase1): read the IF the tuner actually settled on rather than
@@ -278,11 +421,33 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 	 * small accessor patch to the submodule or duplicating the bandwidth
 	 * table here. Hardcoding the documented value keeps Phase 1 moving;
 	 * revisit before trusting 7 and 8 MHz.
+	 *
+	 * RTL_DVBT_IF overrides it, for sweeping by hand while the
+	 * acquisition state machine is stalling and we are still guessing.
 	 */
 	{
 		uint32_t if_hz = (bw_hz <= 6000000) ? 3570000 : 4570000;
+		const char *env = getenv("RTL_DVBT_IF");
+
+		if (env)
+			if_hz = (uint32_t)strtoul(env, NULL, 0);
+
 		if ((r = set_if(dev, if_hz)) < 0)
 			return r;
+	}
+
+	/* RTL_DVBT_SPECINV: same idea. The R820T presents an inverted
+	 * spectrum, so the tables set this to 1, but it is worth being able to
+	 * flip. */
+	{
+		const char *env = getenv("RTL_DVBT_SPECINV");
+
+		if (env) {
+			r = reg_write(dev, DVBT_SPEC_INV,
+				      (uint32_t)strtoul(env, NULL, 0));
+			if (r < 0)
+				return r;
+		}
 	}
 
 	/* Resampler coefficients for this channel bandwidth. */
@@ -308,33 +473,91 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 	return 0;
 }
 
+void rtl2832_dvbt_dump_regs(rtlsdr_dev_t *dev, const char *when)
+{
+	static const struct { uint8_t page; uint16_t addr; const char *what; } r[] = {
+		{0, 0x06, "MPEG_IO_OPT_2_2 (b7) / OPT_ADC_IQ"},
+		{0, 0x07, "MPEG_IO_OPT_1_0 (b7:6)"},
+		{0, 0x08, "AD_EN_REG (b7) / AD_EN_REG1 (b6)  SDR=0x4d"},
+		{0, 0x19, "mode  SDR=0x05  DVB-T=0x20"},
+		{0, 0x61, "PID filter  disabled=0xe0"},
+		{1, 0x01, "SOFT_RST (b2) / IIC_REPEAT (b3)"},
+		{1, 0x04, "AGC: EN_IF (b7) EN_RF (b6) HOLD (b5)"},
+		{1, 0x15, "SPEC_INV (b0)  we want 0x07"},
+		{1, 0xb1, "EN_BBIN (b0)  SDR=0x1a"},
+	};
+
+	fprintf(stderr, "\n--- demod registers %s ---\n", when);
+	for (unsigned i = 0; i < sizeof(r)/sizeof(r[0]); i++)
+		fprintf(stderr, "  page%d 0x%02x = 0x%02x   %s\n",
+			r[i].page, r[i].addr,
+			demod_rd(dev, r[i].page, r[i].addr, 1), r[i].what);
+	fprintf(stderr, "  FSM stage = %d\n\n", rtl2832_dvbt_get_fsm_stage(dev));
+}
+
+int rtl2832_dvbt_get_fsm_stage(rtlsdr_dev_t *dev)
+{
+	uint32_t stage;
+
+	if (!dev || reg_read(dev, DVBT_FSM_STAGE, &stage) < 0)
+		return -1;
+
+	return (int)stage;
+}
+
 int rtl2832_dvbt_get_status(rtlsdr_dev_t *dev)
 {
-	uint16_t tmp;
-	int status = 0;
+	int stage;
 
 	if (!dev)
 		return -1;
 
-	tmp = demod_rd(dev, 1, 0x3c, 1);
+	/*
+	 * The demodulator exposes its acquisition progress as a state-machine
+	 * stage number, not a bitmask. Stage 11 is full lock; stage 10 means
+	 * signal, carrier and Viterbi but no sync yet. Anything lower means it
+	 * is still hunting, which is far more informative than a boolean -
+	 * see rtl2832_dvbt_get_fsm_stage().
+	 */
+	stage = rtl2832_dvbt_get_fsm_stage(dev);
+	if (stage < 0)
+		return -1;
 
-	/* Bit 3 of the FSM state register means the demodulator has reached
-	 * sync. The kernel driver treats that as everything below it being
-	 * true as well, since the stages lock in order. */
-	if (tmp & 0x08) {
-		status = RTL2832_HAS_SIGNAL | RTL2832_HAS_CARRIER |
-			 RTL2832_HAS_VITERBI | RTL2832_HAS_SYNC |
-			 RTL2832_HAS_LOCK;
-	}
+	if (stage == 11)
+		return RTL2832_HAS_SIGNAL | RTL2832_HAS_CARRIER |
+		       RTL2832_HAS_VITERBI | RTL2832_HAS_SYNC |
+		       RTL2832_HAS_LOCK;
 
-	return status;
+	if (stage == 10)
+		return RTL2832_HAS_SIGNAL | RTL2832_HAS_CARRIER |
+		       RTL2832_HAS_VITERBI;
+
+	return 0;
 }
 
 int rtl2832_dvbt_read_snr(rtlsdr_dev_t *dev)
 {
+	uint32_t constel, hier, evm;
+
 	if (!dev)
 		return -1;
 
-	/* Reported in units of 0.1 dB. */
-	return (int)demod_rd(dev, 3, 0x3c, 1);
+	if (reg_read(dev, DVBT_RX_CONSTEL, &constel) < 0 ||
+	    reg_read(dev, DVBT_RX_HIER, &hier) < 0 ||
+	    reg_read(dev, DVBT_CE_EST_EVM, &evm) < 0)
+		return -1;
+
+	/*
+	 * The real figure is
+	 *   (SNR_CONST[constel][hier] - intlog10(evm)) / ((1 << 24) / 100)
+	 * which needs the constant table and fixed-point log from the Java.
+	 * Until the demodulator locks there is nothing to measure, so rather
+	 * than port that now we return the raw error-vector magnitude: it is
+	 * monotonic in the right direction (lower is better) and enough to
+	 * tell whether acquisition is improving.
+	 */
+	(void)constel;
+	(void)hier;
+
+	return (int)evm;
 }
