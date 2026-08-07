@@ -38,6 +38,12 @@ extern int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr,
 			    uint16_t val, uint8_t len);
 extern uint16_t rtlsdr_read_reg(rtlsdr_dev_t *dev, uint8_t block,
 				uint16_t addr, uint8_t len);
+extern int rtlsdr_i2c_write_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr,
+				uint8_t reg, uint8_t val);
+extern void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on);
+
+/* third_party/librtlsdr/include/tuner_r82xx.h */
+#define R820T_I2C_ADDR 0x34
 
 /* Block selector for the system-register space (librtlsdr's USBB). */
 #define RTL2832_BLOCK_USB 1
@@ -380,6 +386,48 @@ int rtl2832_dvbt_init(rtlsdr_dev_t *dev)
 }
 
 /*
+ * Hand the R820T's VGA back to the demodulator's AGC loop.
+ *
+ * R820T register 0x0c bit 4 selects where the VGA takes its gain from:
+ *   1 = follow the VAGC pin, which the RTL2832's IF-AGC loop drives
+ *   0 = "vga code mode", fixed gain from bits 3:0
+ *
+ * Both stacks known to work on this hardware leave it at 1 for DVB-T. The
+ * kernel's init array has 0x0c = 0xf5 (r820t.c:120) and its
+ * r820t_set_tv_standard() writes only the low nibble (r820t.c:1067, mask
+ * 0x0f), so bit 4 survives every tune. The only kernel writes that clear it
+ * live in r820t_set_gain_mode() - the explicit manual-gain path - and
+ * r820t_standby(). Neither is on the DVB-T tuning path.
+ *
+ * librtlsdr clears it on EVERY tune: r82xx_set_freq() calls
+ * r82xx_set_vga_gain() (tuner_r82xx.c:1181), which unconditionally writes
+ * 0x0c mask 0x9f value 0x08 - 16.3 dB fixed, bit 4 = 0. Correct for SDR,
+ * where the demodulator's AGC loops are disabled and the host wants a stable
+ * known gain. Fatal for DVB-T, where that loop is the only gain control there
+ * is: restore_dvbt_defaults() switches the IF-AGC loop on, and then nothing
+ * is listening to its output pin.
+ *
+ * 0xf0 is the init-array byte with the low nibble zeroed, exactly what the
+ * kernel's set_tv_standard writes when IMR calibration has not run - and
+ * librtlsdr never runs IMR calibration.
+ *
+ * Written straight over I2C, bypassing librtlsdr's register shadow. That
+ * shadow is therefore stale for 0x0c afterwards, so this MUST be the last
+ * tuner write of the tune: any later masked write would recompute from the
+ * stale cache and undo it.
+ */
+static int r820t_reconnect_agc_pin(rtlsdr_dev_t *dev)
+{
+	int r;
+
+	rtlsdr_set_i2c_repeater(dev, 1);
+	r = rtlsdr_i2c_write_reg(dev, R820T_I2C_ADDR, 0x0c, 0xf0);
+	rtlsdr_set_i2c_repeater(dev, 0);
+
+	return r;
+}
+
+/*
  * Pick the tuner gain that actually decodes, by measuring.
  *
  * librtlsdr's automatic gain mode is tuned for SDR: it maximises signal level
@@ -613,13 +661,63 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 1)) < 0) return r;
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 0)) < 0) return r;
 
-	/* Everything is configured; now find the gain that actually decodes.
-	 * Skipped when RTL_DVBT_GAIN pins it by hand. */
+	/*
+	 * Gain, in order of preference.
+	 *
+	 * Default is what the kernel does: give the VGA back to the
+	 * demodulator's AGC loop and let the hardware track the signal. That
+	 * adapts to conditions changing under it, which a fixed gain cannot.
+	 *
+	 * RTL_DVBT_GAIN pins a manual gain instead. RTL_DVBT_AUTOGAIN=sweep
+	 * forces the measured sweep, which is the fallback if the AGC pin
+	 * turns out not to lock on some other dongle.
+	 */
 	{
 		const char *g = getenv("RTL_DVBT_GAIN");
+		const char *mode = getenv("RTL_DVBT_AUTOGAIN");
 
-		if (!(g && *g))
+		if (g && *g) {
+			/* already applied above */
+		} else if (mode && !strcmp(mode, "sweep")) {
 			auto_gain(dev);
+		} else {
+			rtl2832_signal_t sig;
+
+			if (r820t_reconnect_agc_pin(dev) < 0)
+				fprintf(stderr, "rtl2832: could not hand the "
+						"VGA back to the AGC loop\n");
+
+			/*
+			 * Give the loop time to settle, then check it got
+			 * anywhere. Fall back to sweeping only if it never
+			 * locks at all.
+			 *
+			 * Deliberately not falling back on a high BER: on a
+			 * marginal channel the loop locks and still cannot
+			 * deliver, and sweeping does not rescue it either.
+			 * Measured across five local channels, the two
+			 * strategies agree within noise everywhere except the
+			 * strongest, where the loop wins outright (BER 0 vs
+			 * 57). Spending two seconds sweeping to arrive at the
+			 * same bad answer helps nobody.
+			 */
+			int locked = 0, i;
+
+			for (i = 0; i < 8; i++) {
+				usleep(200000);
+				if (rtl2832_dvbt_read_signal(dev, &sig) == 0 &&
+				    sig.fsm_stage == 11) {
+					locked = 1;
+					break;
+				}
+			}
+
+			if (!locked) {
+				fprintf(stderr, "rtl2832: AGC loop never "
+						"locked - sweeping instead\n");
+				auto_gain(dev);
+			}
+		}
 	}
 
 	return 0;
@@ -699,6 +797,19 @@ void rtl2832_dvbt_dump_regs(rtlsdr_dev_t *dev, const char *when)
 		fprintf(stderr, "  page%d 0x%02x = 0x%02x   %s\n",
 			r[i].page, r[i].addr,
 			demod_rd(dev, r[i].page, r[i].addr, 1), r[i].what);
+	{
+		uint32_t if_agc = 0, rf_agc = 0;
+
+		reg_read(dev, DVBT_IF_AGC_VAL, &if_agc);
+		reg_read(dev, DVBT_RF_AGC_VAL, &rf_agc);
+
+		/* 14-bit two's complement. Pinned at a rail across repeated
+		 * reads means the loop has no actuator - see
+		 * r820t_reconnect_agc_pin(). */
+		fprintf(stderr, "  IF_AGC = %6d   RF_AGC = %6d\n",
+			(if_agc & 0x2000) ? (int)if_agc - 0x4000 : (int)if_agc,
+			(rf_agc & 0x2000) ? (int)rf_agc - 0x4000 : (int)rf_agc);
+	}
 	fprintf(stderr, "  FSM stage = %d\n\n", rtl2832_dvbt_get_fsm_stage(dev));
 }
 

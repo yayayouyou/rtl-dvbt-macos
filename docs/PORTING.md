@@ -123,6 +123,62 @@ register, porting `readBer()`, and porting the kernel's full `read_status()`
 (constellation, hierarchy, CNR). Each one turned an opaque failure into an
 obvious one. Port the instruments before the features.
 
+
+## The proper fix: give the VGA back to the AGC loop
+
+The gain sweep above works, but it is a workaround — it hunts for a fixed
+operating point that happens to decode. Both stacks that are known to work on
+this hardware do something better, and a later comparison against the kernel
+found it.
+
+**R820T register 0x0c bit 4 selects where the VGA takes its gain from:**
+1 means follow the VAGC pin, which the RTL2832's IF-AGC loop drives; 0 means
+"vga code mode", a fixed gain from bits 3:0.
+
+The kernel leaves it at 1 throughout DVB-T operation: the init array has
+`0x0c = 0xf5` (r820t.c:120) and `r820t_set_tv_standard()` writes only the low
+nibble (r820t.c:1067, mask `0x0f`). The only kernel writes that clear bit 4
+are in `r820t_set_gain_mode()` — the explicit manual-gain path — and
+`r820t_standby()`. Neither is on the tuning path. AndroidDvbDriver agrees.
+
+librtlsdr clears it on **every** tune. `r82xx_set_freq()` calls
+`r82xx_set_vga_gain()` (tuner_r82xx.c:1181), which unconditionally writes
+`0x0c` mask `0x9f` value `0x08` — 16.3 dB fixed, bit 4 = 0. That is right for
+SDR, where the demodulator's AGC loops are off and the host wants a known
+stable gain. It is wrong for DVB-T, where that loop is the only gain control
+in the system: `restore_dvbt_defaults()` switches the IF-AGC loop on, and then
+nothing is listening to its output.
+
+`r820t_reconnect_agc_pin()` writes `0x0c = 0xf0` over I2C as the last tuner
+write of the tune. It must be last — the write bypasses librtlsdr's register
+shadow, so any later masked write would recompute from a stale cache.
+
+**How to tell it worked:** read `DVBT_IF_AGC_VAL` (page3 0x59, 14-bit two's
+complement, in `RTL_DVBT_DUMP=1`). Pinned at a rail across repeated reads
+means the loop has no actuator. Settling mid-scale means it is tracking.
+Before: rail. After: 2183.
+
+Measured over five local channels, loop versus sweep:
+
+| channel | AGC loop | gain sweep |
+|---|---|---|
+| 581 (TTV) | **100% sync, BER 0** | 100% sync, BER 57 |
+| 557 | 96%, BER 109 | 100%, BER 93 |
+| 569 | 97%, BER 19616 | 97%, BER 19616 |
+| 545 | 59%, BER 19616 | 66%, BER 19616 |
+| 533 | 75%, BER 19616 | 69%, BER 19616 |
+
+The loop wins outright on the strongest channel and ties elsewhere, while
+costing no sweep time and adapting to conditions changing under it. It is now
+the default; `RTL_DVBT_AUTOGAIN=sweep` forces the old behaviour, and the
+driver falls back to sweeping on its own if the loop never locks.
+
+Note the three weak channels are unusable under both strategies — CNR around
+21 dB, right at the 64-QAM threshold. That is a signal limit, not a driver
+one, and sweeping does not rescue it. Which is why the fallback triggers on
+"never locked" rather than "high BER": spending two seconds to arrive at the
+same bad answer helps nobody.
+
 ### Two tuner values also corrected
 
 While comparing against the kernel's `r820t_set_tv_standard()`, librtlsdr's
