@@ -175,7 +175,8 @@ int main(int argc, char **argv)
 	}
 
 	if (status)
-		fprintf(stderr, "\nLOCKED - capturing now.\n");
+		fprintf(stderr, "\nLOCKED - BER %d errors/MB, EVM %d\n",
+			rtl2832_dvbt_read_ber(dev), rtl2832_dvbt_read_snr(dev));
 	else
 		fprintf(stderr,
 			"\nNever reached lock in 10s (last stage %d). "

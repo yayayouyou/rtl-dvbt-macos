@@ -32,6 +32,17 @@ extern int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page,
 				  uint16_t addr, uint16_t val, uint8_t len);
 extern uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page,
 				      uint16_t addr, uint8_t len);
+extern int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr,
+			    uint16_t val, uint8_t len);
+extern uint16_t rtlsdr_read_reg(rtlsdr_dev_t *dev, uint8_t block,
+				uint16_t addr, uint8_t len);
+
+/* Block selector for the system-register space (librtlsdr's USBB). */
+#define RTL2832_BLOCK_USB 1
+
+#define RTL2832_USB_SYSCTL       0x2000
+#define RTL2832_USB_EPA_MAXPKT   0x2158
+#define RTL2832_USB_EPA_FIFO_CFG 0x2160
 
 /* ---------------------------------------------------------------------- */
 /* Raw register access                                                     */
@@ -233,6 +244,46 @@ static int restore_dvbt_defaults(rtlsdr_dev_t *dev)
 }
 
 /*
+ * Configure the USB endpoint for transport-stream delivery.
+ *
+ * This is the device-level init() the Java driver runs after the frontend is
+ * up (Rtl28xxDvbDevice.init()), and it is the one piece librtlsdr has no
+ * equivalent for at all. librtlsdr sets USB_SYSCTL and USB_EPA_MAXPKT, but
+ * it defines USB_EPA_FIFO_CFG and then never writes it - SDR mode does not
+ * need the endpoint FIFO reconfigured, TS delivery does.
+ *
+ * Two further differences from librtlsdr, both deliberate:
+ *  - USB_SYSCTL is read-modify-written here (val |= 0x09, "enable DMA and
+ *    Full Packet Mode") rather than blindly assigned 0x09, so whatever else
+ *    the chip has set survives.
+ *  - byte order: librtlsdr's 2-byte write emits val >> 8 first, so the FIFO
+ *    length byte 0x14 at offset 0 means writing 0x1400, not 0x0014.
+ */
+static int init_usb_endpoints(rtlsdr_dev_t *dev)
+{
+	uint16_t val;
+	int r;
+
+	/* enable DMA and Full Packet Mode */
+	val = rtlsdr_read_reg(dev, RTL2832_BLOCK_USB, RTL2832_USB_SYSCTL, 1);
+	val |= 0x09;
+	r = rtlsdr_write_reg(dev, RTL2832_BLOCK_USB, RTL2832_USB_SYSCTL,
+			     val & 0xff, 1);
+	if (r < 0)
+		return r;
+
+	/* EPA maximum packet size 0x0200 */
+	r = rtlsdr_write_reg(dev, RTL2832_BLOCK_USB, RTL2832_USB_EPA_MAXPKT,
+			     0x0002, 2);
+	if (r < 0)
+		return r;
+
+	/* EPA FIFO length */
+	return rtlsdr_write_reg(dev, RTL2832_BLOCK_USB,
+				RTL2832_USB_EPA_FIFO_CFG, 0x1400, 2);
+}
+
+/*
  * Tell the demodulator where the tuner is putting the IF.
  *
  * PSET_IFFREQ = -floor((if_hz % XTAL) * 2^22 / XTAL)
@@ -306,6 +357,13 @@ int rtl2832_dvbt_init(rtlsdr_dev_t *dev)
 
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 1)) < 0) return r;
 	if ((r = reg_write(dev, DVBT_SOFT_RST, 0)) < 0) return r;
+
+	/* Last, matching the Java's open(): frontend first, then the
+	 * device-level USB endpoint setup. */
+	if ((r = init_usb_endpoints(dev)) < 0) {
+		fprintf(stderr, "rtl2832: USB endpoint setup failed\n");
+		return r;
+	}
 
 	return 0;
 }
@@ -408,6 +466,18 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 			r = reg_write(dev, DVBT_SERIAL,
 				      (uint32_t)strtoul(env, NULL, 0));
 			if (r < 0) return r;
+		}
+	}
+
+	/* RTL_DVBT_MPEGIO="<opt22>:<opt10>" - which tap of the demod chain is
+	 * routed out. Small enough space to sweep exhaustively. */
+	{
+		const char *env = getenv("RTL_DVBT_MPEGIO");
+		unsigned a, b;
+
+		if (env && sscanf(env, "%u:%u", &a, &b) == 2) {
+			if ((r = reg_write(dev, DVBT_MPEG_IO_OPT_2_2, a)) < 0) return r;
+			if ((r = reg_write(dev, DVBT_MPEG_IO_OPT_1_0, b)) < 0) return r;
 		}
 	}
 
@@ -533,6 +603,20 @@ int rtl2832_dvbt_get_status(rtlsdr_dev_t *dev)
 		       RTL2832_HAS_VITERBI;
 
 	return 0;
+}
+
+/*
+ * Bit errors per ~1 MB, straight from the demodulator's Reed-Solomon stage
+ * (Java readBer(): page 3, 0x4e, 16 bits). This is the number that says
+ * whether a weak signal is the problem: a demodulator can report lock and
+ * still be handing you packets it could not correct.
+ */
+int rtl2832_dvbt_read_ber(rtlsdr_dev_t *dev)
+{
+	if (!dev)
+		return -1;
+
+	return (int)demod_rd(dev, 3, 0x4e, 2);
 }
 
 int rtl2832_dvbt_read_snr(rtlsdr_dev_t *dev)

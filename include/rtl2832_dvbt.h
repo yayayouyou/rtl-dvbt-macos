@@ -79,4 +79,7 @@ int rtl2832_dvbt_get_fsm_stage(rtlsdr_dev_t *dev);
  */
 int rtl2832_dvbt_read_snr(rtlsdr_dev_t *dev);
 
+/* Bit errors per ~1 MB. High values mean the signal, not the code. */
+int rtl2832_dvbt_read_ber(rtlsdr_dev_t *dev);
+
 #endif /* RTL2832_DVBT_H */

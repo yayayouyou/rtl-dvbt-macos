@@ -92,22 +92,57 @@ Unlike the Java's bare `R820tTuner`, librtlsdr's tuner wrappers touch demod
 registers as a side effect. The DVB-T datapath therefore has to be
 re-asserted *after* the tuner calls, not just once during init.
 
-## Still open
+## Still open — but probably not a code problem
 
-The demodulator locks but the endpoint yields uniformly distributed bytes,
-not 188-byte TS packets (best alignment gives ~2% sync bytes, consistent with
-chance). Verified not to be:
+The demodulator locks and the endpoint delivers data at a plausible TS rate,
+but the bytes are uniformly distributed with no 188-byte structure.
 
-- register configuration — a full readback before capture shows every DVB-T
+**The likely answer is signal quality, not configuration.** `readBer()`
+returns **65535 on every channel — the register's maximum, i.e. saturated**.
+The Reed-Solomon stage is seeing error rates it cannot correct at all. FSM
+stage 11 means carrier and timing acquisition succeeded; it does not mean the
+data survived. A demodulator in exactly this state emits TS-rate output whose
+every packet is uncorrectable, which is indistinguishable from noise — sync
+bytes included.
+
+The measured margin supports that reading: the local signal is 7–9 dB above
+noise floor. DVB-T with 64-QAM wants roughly 20 dB. This is a stock whip
+antenna indoors.
+
+**Next step is a better antenna, not more code.** If BER drops off its rail
+and sync bytes appear, the driver was right all along.
+
+Ruled out along the way, so nobody redoes them:
+
+- register configuration — full readback before capture shows every DVB-T
   field at its intended value (`RTL_DVBT_DUMP=1`)
 - capture timing — capturing the instant stage 11 is observed changes nothing
-- `DVBT_SERIAL` 0 vs 1, IF frequency 0–5 MHz, `SPEC_INV` 0/1, tuner gain
-  mode auto/manual — all swept, none produce sync
+- `DVBT_SERIAL` 0/1, IF 0–5 MHz, `SPEC_INV` 0/1, tuner gain mode auto/manual
+- bit rotations, bit inversion, bit-order reversal, 204-byte packets — no
+  transform reveals TS structure
 - USB endpoint choice — the Java uses interface 0, endpoint 0x81, same as us
 
-So something still routes the ADC path rather than the demodulator's TS
-output to the USB FIFO, or the TS needs an enable this port has not found.
-That is the next thing to chase.
+One genuinely interesting observation: with `MPEG_IO_OPT_1_0 = 2` the
+endpoint runs at ~45 MB/s and the data repeats **exactly every 3760 bytes =
+20 × 188**, which is precisely the `USB_EPA_FIFO_CFG` value of `0x14` (20)
+this driver writes. So that register demonstrably takes effect and the FIFO
+really is 20 TS packets deep — it is simply being replayed rather than flow
+controlled, because the demodulator is not filling it. Useful confirmation
+that the USB side is wired correctly.
+
+## Recovering a wedged dongle
+
+Writing bad values to the MPEG output-routing fields will hang the endpoint
+so hard that even plain `rtl_sdr` stops producing data and blocks forever.
+It is not bricked. `libusb_reset_device()` on `0bda:2838` clears it without
+unplugging:
+
+```c
+libusb_device_handle *h = libusb_open_device_with_vid_pid(ctx, 0x0bda, 0x2838);
+libusb_reset_device(h);
+```
+
+Worth doing between experiments that sweep output-path registers.
 
 ---
 
