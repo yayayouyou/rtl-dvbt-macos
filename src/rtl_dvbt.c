@@ -23,6 +23,7 @@
 static volatile int do_exit = 0;
 static rtlsdr_dev_t *dev = NULL;
 static uint64_t bytes_written = 0;
+static volatile int write_failed = 0;
 static FILE *out = NULL;
 
 static void sighandler(int signum)
@@ -89,6 +90,7 @@ static void ts_callback(unsigned char *buf, uint32_t len, void *ctx)
 		else
 			perror("\nWrite failed");
 
+		write_failed = 1;
 		do_exit = 1;
 		rtlsdr_cancel_async(dev);
 		return;
@@ -140,11 +142,32 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "Device: %s\n", rtlsdr_get_device_name(dev_index));
 
-	if (rtlsdr_get_tuner_type(dev) != RTLSDR_TUNER_R820T) {
-		fprintf(stderr,
-			"Warning: only the R820T tuner is implemented. This "
-			"dongle reports a different tuner, so the register "
-			"tables below will not match and it will not lock.\n");
+	{
+		enum rtlsdr_tuner t = rtlsdr_get_tuner_type(dev);
+
+		if (t == RTLSDR_TUNER_R828D) {
+			/* Not tested here - nobody involved has held one. But
+			 * it is the tuner in most sticks actually sold as
+			 * DVB-T receivers, and librtlsdr gives R820T and R828D
+			 * the same driver and the same demodulator init path,
+			 * so there is no reason to believe it cannot work.
+			 * Saying "it will not lock" would be a claim with
+			 * nothing behind it. */
+			fprintf(stderr,
+				"R828D detected - untested, but it shares the "
+				"R820T driver and register tables upstream, so "
+				"it may well work. Please report the result.\n");
+		} else if (t != RTLSDR_TUNER_R820T) {
+			fprintf(stderr,
+				"This dongle's tuner is not an R820T or R828D.\n"
+				"The demodulator register table, spectrum "
+				"inversion and IF frequency in this driver are "
+				"all R82xx values; they will not match your "
+				"tuner and it will not lock.\n"
+				"Set RTL_DVBT_FORCE_TUNER=1 to try anyway.\n");
+			if (!getenv("RTL_DVBT_FORCE_TUNER"))
+				goto fail;
+		}
 	}
 
 	/* librtlsdr's open() leaves the chip in SDR mode; undo that. */
@@ -237,15 +260,34 @@ int main(int argc, char **argv)
 	fprintf(stderr, "Wrote %llu bytes (%.1f MB)\n",
 		(unsigned long long)bytes_written, bytes_written / 1048576.0);
 
-	if (bytes_written == 0)
+	/*
+	 * Report failure honestly. rtlsdr_read_async() returns 0 whether the
+	 * capture ended cleanly or the device vanished mid-stream - libusb's
+	 * callback sets a private "device lost" flag and cancels, and the
+	 * return value cannot tell the two apart. Probing the demodulator
+	 * afterwards can: reg_read fails and get_fsm_stage returns negative
+	 * once the device is gone.
+	 */
+	if (write_failed) {
+		r = 1;
+	} else if (bytes_written == 0) {
 		fprintf(stderr,
 			"Nothing was captured. The device is not producing "
 			"data on the bulk endpoint.\n");
+		r = 1;
+	} else if (rtl2832_dvbt_get_fsm_stage(dev) < 0) {
+		fprintf(stderr,
+			"Device stopped responding - the capture is "
+			"truncated.\n");
+		r = 1;
+	} else {
+		r = 0;
+	}
 
 	rtlsdr_close(dev);
 	if (out != stdout)
 		fclose(out);
-	return 0;
+	return r;
 
 fail:
 	rtlsdr_close(dev);

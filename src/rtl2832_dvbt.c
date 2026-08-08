@@ -23,12 +23,18 @@
 #include "rtl2832_regs.h"
 
 /*
- * These are defined in librtlsdr.c but deliberately not declared in the
- * public rtl-sdr.h, and librtlsdr builds with -fvisibility=hidden, so they
- * are absent from a stock libr dylib's symbol table. We compile
- * librtlsdr's sources straight into this binary (see CMakeLists.txt), which
- * is why these resolve at link time. Linking against a Homebrew librtlsdr
- * will NOT work.
+ * librtlsdr internals. These are defined in librtlsdr.c and deliberately not
+ * declared in the public rtl-sdr.h - internal API with no stability
+ * guarantee, which is why we compile librtlsdr's sources straight into this
+ * binary (see CMakeLists.txt) rather than linking a prebuilt one.
+ *
+ * Note for anyone tempted to link against a system librtlsdr instead:
+ * whether these symbols are even exported depends on how it was built. Its
+ * autotools build applies -fvisibility=hidden on any compiler
+ * (configure.ac), while its CMake build applies it only under GCC - the
+ * guard is `if(CMAKE_COMPILER_IS_GNUCC AND NOT WIN32)`, which is false for
+ * AppleClang. So a Homebrew macOS build does export them and a source build
+ * elsewhere may not. Depending on that is not a contract.
  */
 extern int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page,
 				  uint16_t addr, uint16_t val, uint8_t len);
@@ -44,6 +50,7 @@ extern void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on);
 
 /* third_party/librtlsdr/include/tuner_r82xx.h */
 #define R820T_I2C_ADDR 0x34
+#define R828D_I2C_ADDR 0x74
 
 /* Block selector for the system-register space (librtlsdr's USBB). */
 #define RTL2832_BLOCK_USB 1
@@ -420,8 +427,15 @@ static int r820t_reconnect_agc_pin(rtlsdr_dev_t *dev)
 {
 	int r;
 
+	/* The R828D answers on a different I2C address. Writing to 0x34 on one
+	 * would go to a device that is not on the bus, and we would not even
+	 * find out: rtlsdr_i2c_write_reg() returns libusb's byte count, never
+	 * an I2C acknowledgement. */
+	uint8_t addr = (rtlsdr_get_tuner_type(dev) == RTLSDR_TUNER_R828D)
+			? R828D_I2C_ADDR : R820T_I2C_ADDR;
+
 	rtlsdr_set_i2c_repeater(dev, 1);
-	r = rtlsdr_i2c_write_reg(dev, R820T_I2C_ADDR, 0x0c, 0xf0);
+	r = rtlsdr_i2c_write_reg(dev, addr, 0x0c, 0xf0);
 	rtlsdr_set_i2c_repeater(dev, 0);
 
 	return r;

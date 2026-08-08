@@ -18,12 +18,15 @@ pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 # librtlsdr
 #
 # We compile librtlsdr's sources directly into our binary rather than linking
-# against a prebuilt library. This is not a style preference - it is required.
-# rtlsdr_demod_write_reg() and rtlsdr_demod_read_reg() are the entire basis of
-# this driver, and they are absent from the public header while librtlsdr
-# builds with -fvisibility=hidden. A Homebrew librtlsdr does not export them,
-# so there is nothing to link against. Building the sources ourselves puts
-# them in the same translation unit set and they resolve normally.
+# against a prebuilt library.
+#
+# The driver depends on several librtlsdr functions that are deliberately
+# absent from rtl-sdr.h - rtlsdr_demod_write_reg() and rtlsdr_demod_read_reg()
+# are the entire basis of it. Internal API, no stability guarantee. Whether a
+# prebuilt librtlsdr even exports them depends on how it was built: the
+# autotools build hides them on any compiler, the CMake build only under GCC.
+# Vendoring pins both the symbols and the exact demodulator behaviour this was
+# verified against.
 # --------------------------------------------------------------------------
 set(LIBRTLSDR_DIR ${CMAKE_SOURCE_DIR}/third_party/librtlsdr)
 

@@ -41,15 +41,48 @@ project is the code that switches it back.
 |---|---|
 | Builds on Apple Silicon | yes |
 | Locks on real DVB-T | yes, BER 0 |
-| Valid MPEG-2 TS out | yes, 100% packet sync |
-| Plays in VLC / ffmpeg | yes |
-| Tuners supported | **R820T only** (E4000 / FC0012 tables are generated but not wired up) |
-| Bandwidths | 6 / 7 / 8 MHz — only 6 MHz verified on air |
-| Channel scanning | not yet |
+| Valid MPEG-2 TS out | yes — 99.93% packet sync over a 3-minute continuous capture |
+| Plays in ffplay / VLC / mpv | yes |
+| Tuners | **R820T** verified. **R828D** accepted but untested. Others refused unless forced. |
+| Bandwidths | 6 / 7 / 8 MHz implemented — **only 6 MHz verified on air** |
+| Channel scanning | not yet — you must know the frequency |
 | DVB-T2 | no |
 
-Tested on one dongle (`0bda:2838`, R820T) in one country. Reports from other
-hardware and other broadcast standards are very welcome.
+### What has actually been tested, and what has not
+
+Being specific about this so nobody wastes an evening:
+
+**Tested:** one dongle (`0bda:2838`, R820T tuner) on one Apple Silicon Mac,
+against Taiwan's terrestrial DVB-T — 6 MHz channels, 64-QAM, hierarchy 0.
+Three minutes of continuous capture holds lock with 99.93% packet sync and no
+phase drift. A clean recursive clone was built and run to confirm what you get
+is what was tested.
+
+**Not tested at all:**
+
+- **7 and 8 MHz bandwidths.** Most of Europe is 8 MHz. The code paths exist
+  and come from the same kernel tables as the working 6 MHz one, but no 8 MHz
+  signal has ever been put through this. If you are in Europe, you are the
+  first — please say how it goes.
+- **The R828D tuner**, which is what most sticks sold as DVB-T receivers
+  actually contain. It shares librtlsdr's R820T driver and demodulator init
+  path, so there is reason to expect it works, but that is inference, not a
+  measurement.
+- Every other tuner (E4000, FC0012, FC0013). Register tables are generated for
+  some of them but nothing is wired up; the driver refuses to run unless you
+  set `RTL_DVBT_FORCE_TUNER=1`.
+- QPSK and 16-QAM constellations, hierarchical modes, and any guard interval
+  other than whatever Taiwan transmits.
+- Intel Macs. Nothing here should be Apple-Silicon-specific, but it has not
+  been run on one.
+- Long captures beyond three minutes, and recovery from the device being
+  unplugged mid-capture (it is detected and reported, but the path is only
+  reasoned about, not exercised).
+
+**Known limit:** channels arriving below roughly 22 dB CNR do not decode
+usefully here, whichever gain strategy is used. On the author's antenna that
+is four of the five local multiplexes. That looks like a signal limit rather
+than a driver one, but it has not been proven.
 
 ## Build
 
@@ -145,9 +178,13 @@ third_party/librtlsdr   submodule; compiled in, not linked
 ```
 
 `librtlsdr` is **compiled from source into the binary** rather than linked.
-This is required, not stylistic: `rtlsdr_demod_write_reg()` is the basis of
-this entire driver, it is not declared in the public header, and librtlsdr
-builds with `-fvisibility=hidden`. A Homebrew `librtlsdr` does not export it.
+The driver depends on several librtlsdr functions that are deliberately absent
+from `rtl-sdr.h` — `rtlsdr_demod_write_reg()` is the basis of the whole thing.
+That is internal API with no stability guarantee, and whether a prebuilt
+`librtlsdr` even exports it depends on how it was built (its autotools build
+hides internal symbols on any compiler; its CMake build only under GCC).
+Vendoring pins both the symbols and the exact demodulator behaviour this was
+verified against.
 
 The submodule is used **unmodified**. An earlier version of this project
 patched two tuner constants back to the kernel's DVB-T values; once the AGC
