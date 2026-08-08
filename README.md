@@ -117,6 +117,33 @@ does not exist gives you a broken pipe, and `rtl_dvbt` will say so and stop.
 Bandwidth defaults to 6 MHz (Taiwan, Americas). Use `-b 7000000` or
 `-b 8000000` elsewhere.
 
+### What you actually get
+
+An MPEG-2 transport stream, exactly as broadcast. That is the point, but it
+means two properties of the broadcast land in your lap rather than being
+smoothed over here, and both surprised the author while building a viewer on
+top of this:
+
+- **The video is usually interlaced.** 1080i is normal for DVB-T — 59.94
+  fields woven into 29.97 frames. `ffplay` and VLC deinterlace on request;
+  **browsers do not deinterlace at all**, so anything you feed a `<video>`
+  element will comb visibly on motion. If you are building something
+  web-facing, plan to deinterlace (`-vf yadif=mode=1`); on Apple Silicon
+  `h264_videotoolbox` makes that affordable in real time.
+- **The audio is often AAC in LATM/LOAS framing.** ffmpeg, ffplay, VLC and mpv
+  all decode it. **HLS does not accept it** — it wants ADTS. Remuxing with
+  `-c copy` into HLS produces a stream browsers accept and then play in total
+  silence, with no error anywhere. `-c:a aac` fixes it.
+
+Neither is a driver bug and neither is worth "fixing" here: this tool's job is
+to hand you the broadcast unaltered. But knowing beforehand saves an evening.
+
+Check what your own transmitter sends with `ffprobe`:
+
+```bash
+ffprobe -show_entries stream=codec_name,field_order,avg_frame_rate out.ts
+```
+
 Don't know which frequencies carry signal? Scan the UHF band first with
 librtlsdr's own tool:
 
