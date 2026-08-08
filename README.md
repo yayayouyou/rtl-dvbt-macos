@@ -54,7 +54,7 @@ hardware and other broadcast standards are very welcome.
 ## Build
 
 ```bash
-git clone --recursive https://github.com/<you>/rtl-dvbt-macos
+git clone --recursive https://github.com/yayayouyou/rtl-dvbt-macos
 cd rtl-dvbt-macos
 brew install cmake pkg-config libusb
 cmake -S . -B build && cmake --build build
@@ -95,20 +95,30 @@ Channels appear as flat plateaus 6 MHz wide, on 6 MHz centres.
 
 ### Gain
 
-The driver sweeps tuner gain on tune and keeps whatever decodes best, which
-takes a second or two. Pin it with `RTL_DVBT_GAIN=<tenths of a dB>` to skip
-that.
+By default the driver hands the tuner's VGA back to the demodulator's own AGC
+loop — the same thing the Linux kernel does for DVB-T — and lets the hardware
+track the signal. No configuration needed.
 
-This is not a nicety. librtlsdr's automatic gain is optimised for SDR — it
-maximises level into the ADC, which on a strong transmitter drives the R820T
-into compression. The demodulator still locks, still reports valid TPS, and
-still hands you bytes at the right rate — but Reed-Solomon cannot correct any
-of them. Same channel, seconds apart:
+This is not a nicety, and it is the single thing that took longest to find.
+librtlsdr is an SDR library: it deliberately disables the demodulator's AGC
+loops and pins the tuner at a fixed gain, because an SDR host wants a known
+stable gain. For DVB-T that loop is the *only* gain control in the system, and
+with it disconnected the front end sits wherever librtlsdr left it. On a
+strong transmitter that is deep in compression — at which point the
+demodulator still locks, still reports valid TPS, still delivers bytes at the
+right rate, and Reed-Solomon cannot correct a single one of them:
 
-| gain | CNR | BER | usable? |
+| gain source | CNR | BER | usable? |
 |---|---|---|---|
-| librtlsdr automatic | 16.1 dB | 65535/1e6 | no — indistinguishable from noise |
-| 22.9 dB (swept) | 24.4 dB | 0/1e6 | yes |
+| librtlsdr's fixed gain | 16.1 dB | 65535/1e6 | no — indistinguishable from noise |
+| demodulator AGC loop | 24.0 dB | 0/1e6 | yes |
+
+Two escape hatches if that does not suit your hardware:
+
+- `RTL_DVBT_GAIN=<tenths of a dB>` pins a manual gain.
+- `RTL_DVBT_AUTOGAIN=sweep` measures every gain in the tuner's table and keeps
+  the one with the lowest bit error rate. Slower, but it is also what the
+  driver falls back to on its own if the AGC loop never locks.
 
 ### Diagnostics
 
@@ -139,9 +149,11 @@ This is required, not stylistic: `rtlsdr_demod_write_reg()` is the basis of
 this entire driver, it is not declared in the public header, and librtlsdr
 builds with `-fvisibility=hidden`. A Homebrew `librtlsdr` does not export it.
 
-Two values in the vendored `tuner_r82xx.c` are changed back to the Linux
-kernel's DVB-T settings (`filt_gain` 0x30 → 0x10, `loop_through` 0x80 → 0x00);
-librtlsdr had altered them for SDR use.
+The submodule is used **unmodified**. An earlier version of this project
+patched two tuner constants back to the kernel's DVB-T values; once the AGC
+loop was reconnected properly they turned out to make no measurable
+difference, so the patch was dropped rather than carried. A clean recursive
+clone is exactly what was tested.
 
 ## Credit
 

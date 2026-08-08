@@ -189,9 +189,16 @@ While comparing against the kernel's `r820t_set_tv_standard()`, librtlsdr's
 | `filt_gain` | 0x10 | 0x30 |
 | `loop_through` | 0x00 (lt on) | 0x80 (lt off) |
 
-Changed back to the kernel's values in the vendored copy. Neither was the
-blocker on its own - BER stayed at 65535 after the change - but they are the
-kernel's tested settings for this delivery system.
+These were changed back to the kernel's values in the vendored copy while
+hunting the blocker. Neither helped - BER stayed at 65535 - and once the AGC
+pin was reconnected the driver reached BER 0 with the submodule untouched, so
+the patch was reverted rather than carried. **A clean recursive clone was then
+re-tested on hardware and reaches BER 0 and 100% packet sync**, which is the
+version anyone else gets.
+
+Recording them anyway because the difference is real and someone chasing a
+7 or 8 MHz problem may want to know: librtlsdr genuinely does differ from the
+kernel here.
 
 Also worth knowing: librtlsdr calls `r82xx_set_tv_standard()` exactly once,
 from `r82xx_init()`, with a hardcoded `bw=3`. The kernel calls it on **every**
