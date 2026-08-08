@@ -16,7 +16,38 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <libusb.h>
+
 #include "rtl2832_dvbt.h"
+
+/* Realtek RTL2832U. Same pair tools/usbreset.c uses. */
+#define RTL_VID 0x0bda
+#define RTL_PID 0x2838
+
+/*
+ * Reset the dongle at the USB level. Returns 0 if a reset was issued.
+ *
+ * Only works when the device is enumerated - a wedged dongle, not an absent
+ * one. See the caller for why that distinction matters.
+ */
+static int usb_reset_device(void)
+{
+	libusb_context *ctx = NULL;
+	libusb_device_handle *h;
+	int r = -1;
+
+	if (libusb_init(&ctx) < 0)
+		return -1;
+
+	h = libusb_open_device_with_vid_pid(ctx, RTL_VID, RTL_PID);
+	if (h) {
+		r = libusb_reset_device(h);
+		libusb_close(h);
+	}
+
+	libusb_exit(ctx);
+	return r;
+}
 
 #define DEFAULT_BUF_LEN (16 * 16384)
 
@@ -130,14 +161,53 @@ int main(int argc, char **argv)
 	}
 
 	if (rtlsdr_get_device_count() == 0) {
-		fprintf(stderr, "No RTL-SDR devices found.\n");
+		/*
+		 * Zero devices means nothing matching is on the USB bus at all,
+		 * which no amount of resetting will change - libusb cannot open
+		 * what it cannot find. Say what to check rather than just what
+		 * failed, because "plugged in but not detected" is common with
+		 * these dongles and the fix is physical.
+		 */
+		fprintf(stderr,
+			"No RTL-SDR devices found.\n"
+			"The dongle is not on the USB bus. Confirm with:\n"
+			"  ioreg -p IOUSB -l | grep RTL2838\n"
+			"If that prints nothing, unplug and replug it - and "
+			"prefer a port on the machine itself over a hub.\n");
 		return 1;
 	}
 
 	r = rtlsdr_open(&dev, dev_index);
 	if (r < 0) {
-		fprintf(stderr, "Failed to open device %d\n", dev_index);
-		return 1;
+		/*
+		 * A dongle that is present but wedged will refuse to open, and
+		 * stays that way until something resets it at the USB level -
+		 * a previous run killed at the wrong moment, or a bad register
+		 * write to the output-routing fields, will both do it. Since
+		 * we can fix that without troubling the user, do.
+		 *
+		 * This cannot help a dongle that is not enumerated at all.
+		 * Nothing in userspace can: macOS exposes no way to power-cycle
+		 * a port. If it is not on the bus, it needs a hand.
+		 */
+		fprintf(stderr, "Could not open device %d, resetting USB...\n",
+			dev_index);
+
+		if (usb_reset_device() == 0) {
+			usleep(1500000); /* let it re-enumerate */
+			r = rtlsdr_open(&dev, dev_index);
+		}
+
+		if (r < 0) {
+			fprintf(stderr,
+				"Still could not open device %d. If it is "
+				"plugged in but never appears, unplug and "
+				"replug it - check with:\n"
+				"  ioreg -p IOUSB -l | grep RTL2838\n",
+				dev_index);
+			return 1;
+		}
+		fprintf(stderr, "Recovered.\n");
 	}
 
 	fprintf(stderr, "Device: %s\n", rtlsdr_get_device_name(dev_index));
