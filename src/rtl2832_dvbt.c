@@ -59,6 +59,13 @@ extern void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on);
 #define RTL2832_USB_EPA_MAXPKT   0x2158
 #define RTL2832_USB_EPA_FIFO_CFG 0x2160
 
+/*
+ * Post-Viterbi bit errors per million below which Reed-Solomon comfortably
+ * cleans up and the picture holds. Above it, packets start being dropped and
+ * you see it: brief freezes, blocking, audio staying fine while video stalls.
+ */
+#define RTL2832_BER_GOOD_ENOUGH 50
+
 /* ---------------------------------------------------------------------- */
 /* Raw register access                                                     */
 /* ---------------------------------------------------------------------- */
@@ -441,6 +448,43 @@ static int r820t_reconnect_agc_pin(rtlsdr_dev_t *dev)
 	return r;
 }
 
+
+/*
+ * Median post-Viterbi BER over several samples.
+ *
+ * A single reading is not a measurement. Sampling a locked, unchanged channel
+ * gives values swinging between 50 and 207 half a second apart - the register
+ * reports errors seen since the last read, so it is a small noisy window, not
+ * a level. Comparing two gain strategies on one sample each is comparing
+ * their luck, which is exactly the mistake that produced "the sweep is 13x
+ * better" from what turned out to be overlapping distributions.
+ */
+static int measure_ber(rtlsdr_dev_t *dev)
+{
+	enum { N = 5 };
+	int v[N], n = 0;
+	rtl2832_signal_t sig;
+
+	for (int i = 0; i < N; i++) {
+		usleep(300000);
+		if (rtl2832_dvbt_read_signal(dev, &sig) < 0)
+			continue;
+		if (sig.fsm_stage != 11)
+			return -1; /* lost lock - not comparable */
+		v[n++] = sig.ber;
+	}
+
+	if (!n)
+		return -1;
+
+	for (int i = 1; i < n; i++)		/* insertion sort, n is 5 */
+		for (int j = i; j > 0 && v[j] < v[j - 1]; j--) {
+			int t = v[j]; v[j] = v[j - 1]; v[j - 1] = t;
+		}
+
+	return v[n / 2];
+}
+
 /*
  * Pick the tuner gain that actually decodes, by measuring.
  *
@@ -702,18 +746,18 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 						"VGA back to the AGC loop\n");
 
 			/*
-			 * Give the loop time to settle, then check it got
-			 * anywhere. Fall back to sweeping only if it never
-			 * locks at all.
+			 * Let the loop settle, then decide whether to also try
+			 * sweeping - and keep whichever actually decodes better.
 			 *
-			 * Deliberately not falling back on a high BER: on a
-			 * marginal channel the loop locks and still cannot
-			 * deliver, and sweeping does not rescue it either.
-			 * Measured across five local channels, the two
-			 * strategies agree within noise everywhere except the
-			 * strongest, where the loop wins outright (BER 0 vs
-			 * 57). Spending two seconds sweeping to arrive at the
-			 * same bad answer helps nobody.
+			 * Neither strategy wins everywhere, which is why this
+			 * measures instead of choosing. On a strong signal the
+			 * loop is better: it tracks, and it got BER 0 where a
+			 * swept fixed gain got 57. Near the 64-QAM threshold
+			 * that reverses - measured on the same channel 1.5 dB
+			 * weaker, the loop gave BER 95 and the sweep gave 7.
+			 *
+			 * So: trust the loop when it is already delivering, and
+			 * spend the two seconds on a sweep when it is not.
 			 */
 			int locked = 0, i;
 
@@ -730,6 +774,35 @@ int rtl2832_dvbt_set_params(rtlsdr_dev_t *dev, uint32_t freq_hz, uint32_t bw_hz)
 				fprintf(stderr, "rtl2832: AGC loop never "
 						"locked - sweeping instead\n");
 				auto_gain(dev);
+			} else {
+				int loop_ber = measure_ber(dev);
+
+				if (loop_ber > RTL2832_BER_GOOD_ENOUGH) {
+					fprintf(stderr,
+						"rtl2832: AGC loop at BER %d - "
+						"trying a gain sweep\n", loop_ber);
+
+					auto_gain(dev);
+
+					/* Ties go to the loop: it tracks
+					 * conditions, a fixed gain cannot. */
+					int swept = measure_ber(dev);
+
+					if (swept < 0 || swept >= loop_ber) {
+						fprintf(stderr,
+							"rtl2832: sweep no better "
+							"(BER %d vs %d) - keeping "
+							"the AGC loop\n",
+							swept, loop_ber);
+						rtlsdr_set_tuner_gain_mode(dev, 0);
+						r820t_reconnect_agc_pin(dev);
+					} else {
+						fprintf(stderr,
+							"rtl2832: sweep wins "
+							"(BER %d vs %d)\n",
+							swept, loop_ber);
+					}
+				}
 			}
 		}
 	}
