@@ -9,6 +9,7 @@
  * (at your option) any later version.
  */
 
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,7 +78,17 @@ static void ts_callback(unsigned char *buf, uint32_t len, void *ctx)
 		return;
 
 	if (fwrite(buf, 1, len, out) != len) {
-		fprintf(stderr, "Short write, stopping\n");
+		/* The common case by far is piping into a player that is not
+		 * installed, where the shell reports "command not found" and
+		 * we inherit the broken pipe. Say so, rather than dying
+		 * silently right after announcing a good lock. */
+		if (errno == EPIPE)
+			fprintf(stderr,
+				"\nOutput pipe closed - is the program you "
+				"piped into installed and still running?\n");
+		else
+			perror("\nWrite failed");
+
 		do_exit = 1;
 		rtlsdr_cancel_async(dev);
 		return;
@@ -202,6 +213,12 @@ int main(int argc, char **argv)
 	sa.sa_handler = sighandler;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+
+	/* Take SIGPIPE ourselves. Its default action is to kill the process
+	 * outright, which meant piping into a missing player looked like the
+	 * driver crashing immediately after reporting a clean lock. */
+	sa.sa_handler = SIG_IGN;
+	sigaction(SIGPIPE, &sa, NULL);
 
 	if (seconds > 0) {
 		sa.sa_handler = sighandler;

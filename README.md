@@ -69,11 +69,17 @@ If you cloned without `--recursive`: `git submodule update --init --recursive`
 ffprobe out.ts
 ```
 
-Watch it live — no player needed, anything that reads MPEG-2 TS works:
+Watch it live. There is no player in this project and there does not need to
+be — anything that reads MPEG-2 TS from a pipe works:
 
 ```bash
-./build/rtl_dvbt -f 581M | vlc -
+./build/rtl_dvbt -f 581M | ffplay -
 ```
+
+`ffplay` ships with ffmpeg, which you probably already have if you ran
+`ffprobe` above. `mpv -` and `vlc -` work the same way; install them first
+(`brew install mpv`, `brew install --cask vlc`) — piping into a command that
+does not exist gives you a broken pipe, and `rtl_dvbt` will say so and stop.
 
 Bandwidth defaults to 6 MHz (Taiwan, Americas). Use `-b 7000000` or
 `-b 8000000` elsewhere.
