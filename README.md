@@ -190,6 +190,28 @@ decoded (you cannot get that from noise), `BER` is post-Viterbi errors per
 million bits. If `BER` is in the tens of thousands, suspect gain before
 anything else.
 
+That line is printed once, at lock. `-s <seconds>` keeps printing it while
+capturing — reception changes under a running capture, and a reading from an
+hour ago says nothing about now:
+
+```bash
+./build/rtl_dvbt -f 593M -s 2 | ffplay -
+```
+
+Each report's `BER` then covers the interval since the previous one. The
+reads are the same status registers the Linux driver polls during streaming,
+on the control endpoint, so they do not touch the stream: 25 seconds with a
+report every second had no more transport errors than 25 seconds without
+(none, on that channel).
+
+A level that looks fine with a stubbornly high `BER` is worth recognising.
+One multiplex here sat at a steady 23 dB CNR — comfortably above what 64-QAM
+needs — with 5,700–8,300 errors per million on every report and 1–5% of
+packets beyond repair, while a neighbouring multiplex on the same antenna
+read 25 dB and zero. That is interference or reflections on that frequency,
+not a weak signal, and no gain setting fixes it: the driver's sweep tried
+and did worse.
+
 If a dongle stops producing data entirely — even under plain `rtl_sdr` — it is
 wedged, not bricked. `tools/usbreset.c` clears it without unplugging.
 

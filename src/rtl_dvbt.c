@@ -10,6 +10,7 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,10 @@ static int usb_reset_device(void)
 
 static volatile int do_exit = 0;
 static rtlsdr_dev_t *dev = NULL;
+
+/* -s: seconds between signal reports while capturing; 0 reports once. */
+static int report_every = 0;
+static volatile int capturing = 0;
 static uint64_t bytes_written = 0;
 static volatile int write_failed = 0;
 static FILE *out = NULL;
@@ -66,17 +71,69 @@ static void sighandler(int signum)
 		rtlsdr_cancel_async(dev);
 }
 
+static void print_signal(const rtl2832_signal_t *sig)
+{
+	fprintf(stderr,
+		"\n  stage=%d  agc=0x%02x  constellation=%s  "
+		"hierarchy=%d  TPS=%s\n  CNR=%.2f dB  EVM=%d  "
+		"BER=%d/1e6\n",
+		sig->fsm_stage, sig->digital_agc,
+		sig->constellation == 0 ? "QPSK" :
+		sig->constellation == 1 ? "16QAM" :
+		sig->constellation == 2 ? "64QAM" : "INVALID",
+		sig->hierarchy,
+		sig->tps_valid ? "valid" : "GARBAGE",
+		sig->cnr_millidb / 1000.0, sig->evm, sig->ber);
+}
+
+/*
+ * Signal reports during capture (-s).
+ *
+ * Reception changes under a running capture - weather, interference, an
+ * antenna someone nudged - and a single report taken at lock says nothing
+ * about the hours after it. A front end showing that one report as current
+ * was showing a number that could be hours stale, and could not tell a
+ * channel that had faded from one that was fine.
+ *
+ * Reading the demodulator's status registers while streaming is what the
+ * Linux driver does all along. They are control transfers on endpoint 0 and
+ * read-only, so they do not disturb the bulk transfers carrying the stream.
+ * BER is the error count since the previous read, so each report covers the
+ * interval since the last one.
+ */
+static void *reporter(void *arg)
+{
+	(void)arg;
+
+	while (capturing && !do_exit) {
+		for (int i = 0; i < report_every * 10; i++) {
+			if (!capturing || do_exit)
+				return NULL;
+			usleep(100000);
+		}
+
+		rtl2832_signal_t sig;
+
+		if (rtl2832_dvbt_read_signal(dev, &sig) == 0)
+			print_signal(&sig);
+	}
+	return NULL;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
 "rtl_dvbt - DVB-T transport stream capture for RTL2832U on macOS\n"
 "\n"
-"Usage: rtl_dvbt -f <freq> [-b <bandwidth>] [-d <index>] [-n <seconds>] [file]\n"
+"Usage: rtl_dvbt -f <freq> [-b <bandwidth>] [-d <index>] [-n <seconds>]\n"
+"                [-s <seconds>] [file]\n"
 "\n"
 "  -f <freq>       channel centre frequency in Hz (accepts 545M, 545000000)\n"
 "  -b <bandwidth>  channel bandwidth in Hz, default 6000000 (Taiwan)\n"
 "  -d <index>      device index, default 0\n"
 "  -n <seconds>    stop after this many seconds, default run until Ctrl-C\n"
+"  -s <seconds>    report signal quality every N seconds while capturing,\n"
+"                  default only once, at lock\n"
 "  file            output file, default stdout\n"
 "\n"
 "Example - capture 10 seconds and inspect what came back:\n"
@@ -136,12 +193,13 @@ int main(int argc, char **argv)
 	struct sigaction sa;
 	int opt, r, status;
 
-	while ((opt = getopt(argc, argv, "f:b:d:n:h")) != -1) {
+	while ((opt = getopt(argc, argv, "f:b:d:n:s:h")) != -1) {
 		switch (opt) {
 		case 'f': freq = parse_freq(optarg); break;
 		case 'b': bw = parse_freq(optarg); break;
 		case 'd': dev_index = atoi(optarg); break;
 		case 'n': seconds = atoi(optarg); break;
+		case 's': report_every = atoi(optarg); break;
 		default: usage();
 		}
 	}
@@ -283,17 +341,7 @@ int main(int argc, char **argv)
 		rtl2832_signal_t sig;
 
 		if (rtl2832_dvbt_read_signal(dev, &sig) == 0)
-			fprintf(stderr,
-				"\n  stage=%d  agc=0x%02x  constellation=%s  "
-				"hierarchy=%d  TPS=%s\n  CNR=%.2f dB  EVM=%d  "
-				"BER=%d/1e6\n",
-				sig.fsm_stage, sig.digital_agc,
-				sig.constellation == 0 ? "QPSK" :
-				sig.constellation == 1 ? "16QAM" :
-				sig.constellation == 2 ? "64QAM" : "INVALID",
-				sig.hierarchy,
-				sig.tps_valid ? "valid" : "GARBAGE",
-				sig.cnr_millidb / 1000.0, sig.evm, sig.ber);
+			print_signal(&sig);
 	}
 	else
 		fprintf(stderr,
@@ -325,7 +373,21 @@ int main(int argc, char **argv)
 	rtlsdr_reset_buffer(dev);
 
 	fprintf(stderr, "Capturing... (Ctrl-C to stop)\n");
+
+	pthread_t reporter_thread;
+	int reporting = 0;
+
+	capturing = 1;
+	if (report_every > 0)
+		reporting = pthread_create(&reporter_thread, NULL,
+					   reporter, NULL) == 0;
+
 	rtlsdr_read_async(dev, ts_callback, NULL, 0, DEFAULT_BUF_LEN);
+
+	/* Stop reporting before anything below closes the device. */
+	capturing = 0;
+	if (reporting)
+		pthread_join(reporter_thread, NULL);
 
 	fprintf(stderr, "Wrote %llu bytes (%.1f MB)\n",
 		(unsigned long long)bytes_written, bytes_written / 1048576.0);
